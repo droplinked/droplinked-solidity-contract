@@ -1,14 +1,18 @@
-// SPDX-License-Identifier: GPL-3.0
-pragma solidity >=0.8.0<0.9;
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.9;
 
 import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
-contract simpleStorage is ERC1155{
+contract Droplinked is ERC1155{
+    AggregatorV3Interface internal priceFeed;
+
     error NotApprovedSign(); 
     error OldPrice(); 
     
     // The Mint would be emitted on Minting new product
-    event Mint(uint token_id, address recipient, uint amount, uint balance);
+    event Mint_event(uint token_id, address recipient, uint amount);
 
     // PublishRequest would be emitted when a new publish request is made
     event PulishRequest(uint token_id, uint request_id);
@@ -17,10 +21,10 @@ contract simpleStorage is ERC1155{
     event AcceptRequest(uint request_id);
 
     // Cancelequest would be emitted when the `cancel_request` function is called
-    event CancelRequest(uint request_id);
+    event CancelRequest(uint request_id); 
 
     // DisapproveRequest would be emitted when the `disapprove` function is called
-    event DisapproveRequest(uint request_id, uint token_id);
+    event DisapproveRequest(uint request_id);
 
     // NFTMetadata Struct
     struct NFTMetadata {
@@ -36,6 +40,10 @@ contract simpleStorage is ERC1155{
         address publisher;
         bool accepted;
     }
+
+    // TokenID => ItsTotalSupply
+    mapping (uint => uint) token_cnts;
+ 
     // Keeps the record of the minted tokens
     uint public token_cnt;
 
@@ -78,6 +86,12 @@ contract simpleStorage is ERC1155{
     constructor(uint _fee, address ratio_verifier) ERC1155("") {
         fee = _fee;
         ratioVerifier = ratio_verifier;
+        priceFeed = AggregatorV3Interface(0xd0D5e3DB44DE05E9F294BB0a3bEEaF030DE24Ada);
+    }
+
+    function getLatestPrice() public view returns (uint){
+        (,int256 price,,,) = priceFeed.latestRoundData();
+        return uint(price);
     }
 
     function uri(uint256 token_id) public view virtual override returns (string memory) {
@@ -109,10 +123,11 @@ contract simpleStorage is ERC1155{
             holders[msg.sender][token_id] += amount;
         }
         total_supply += amount;
+        token_cnts[token_id] += amount;
         _mint(msg.sender, token_id, amount, "");
         uris[token_id] = _uri;
         emit URI(_uri, token_id);
-        emit Mint(token_id, msg.sender,amount,holders[msg.sender][token_id]);
+        emit Mint_event(token_id, msg.sender,amount);
     }
     
     function publish_request(address producer_account, uint token_id) public{
@@ -186,9 +201,11 @@ contract simpleStorage is ERC1155{
         producer_requests[msg.sender][request_id] = false;
         publishers_requests[requests[request_id].publisher][request_id] = false;
         isRequested[requests[request_id].producer][requests[request_id].token_id] = false;
+        requests[request_id].accepted = false;
+        emit DisapproveRequest(request_id);
     }
 
-    function direct_buy(uint price, uint ratio, uint _blockHeight, address recipient, uint8 _v, bytes32 _r, bytes32 _s) public payable {
+    function verify_signature(uint ratio, uint _blockHeight, uint8 _v, bytes32 _r, bytes32 _s) view private{
         if(block.number>_blockHeight+10){
              revert OldPrice();
         }
@@ -199,17 +216,54 @@ contract simpleStorage is ERC1155{
         if (signer != ratioVerifier) {
             revert NotApprovedSign();
         }
-        payable(recipient).transfer(((price*ratio) / 100) * 1000000000000000000);
-    }
-    
-    function buy_recorded(uint token_id, uint amount) public {
-        
     }
 
-    function buy_affiliate(uint request_id, uint amount) public {
-        
+    function direct_buy(uint price, address recipient) public payable {
+        uint totalAmount = (price*getLatestPrice())/1e10;
+        uint droplinkedShare = (totalAmount*fee)/1e2;
+        require(msg.value >= totalAmount , "Not enough tokens!");
+        (bool t,) = payable(ratioVerifier).call{value : droplinkedShare}("");
+        require(t , "transfer failed");
+        (t,) = payable(recipient).call{ value : (totalAmount)}("");
+        require(t, "tranfer failed");
     }
-    function totalSupply() public view returns (uint){
-        return token_cnt;
+    
+    function buy_recorded(address producer, uint token_id, uint shipping, uint tax, uint amount, uint ratio, uint _blockHeight, uint8 _v, bytes32 _r, bytes32 _s) public payable{
+        require(holders[producer][token_id] >= amount, "Not enough amount to purchase");
+        verify_signature(ratio, _blockHeight, _v, _r, _s);
+        uint product_price = amount * metadatas[token_id].price * (10000000000000000)* ratio;
+        require(msg.value >= product_price + (shipping + tax)*1000000000000000000);
+        uint droplinked_share = (product_price * fee) / 10000;
+        uint producer_share = (product_price + (shipping + tax)*1000000000000000000) - (droplinked_share);
+        require(holders[producer][token_id] >= amount);
+        payable(ratioVerifier).transfer(droplinked_share);
+        payable(producer).transfer(producer_share);
+        holders[msg.sender][token_id] += amount;
+        holders[producer][token_id] -= amount;
+    }
+
+    function buy_affiliate(uint request_id, uint amount, uint shipping, uint tax, uint ratio, uint _blockHeight, uint8 _v, bytes32 _r, bytes32 _s) public payable{
+        verify_signature(ratio, _blockHeight, _v, _r, _s);
+        address prod = requests[request_id].producer;
+        address publ = requests[request_id].publisher;
+        uint token_id = requests[request_id].token_id;
+        uint product_price = amount * metadatas[token_id].price * ratio * (10000000000000000);
+        uint total_amount = product_price + (shipping + tax)*1000000000000000000;
+        require(msg.value >= total_amount, "Not enough token sent!");
+        require(holders[prod][token_id] >= amount , "Not enough NFTs to purchase!");
+        // Calculations
+        uint droplinked_share = (product_price * fee) / 10000;
+        uint publisher_share = ((product_price - droplinked_share) * metadatas[token_id].comission) / 10000;
+        uint producer_share = total_amount - (droplinked_share + publisher_share);
+        // Money transfer
+        payable(ratioVerifier).transfer(droplinked_share);
+        payable(prod).transfer(producer_share);
+        payable(publ).transfer(publisher_share);
+        // Transfer
+        holders[msg.sender][token_id] += amount;
+        holders[prod][token_id] -= amount;
+    }
+    function totalSupply(uint256 id) public view returns (uint256){
+        return token_cnts[id];
     }
 }
