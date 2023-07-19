@@ -8,9 +8,27 @@ import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 contract Droplinked is ERC1155{
     AggregatorV3Interface internal priceFeed;
 
-    error NotApprovedSign(); 
-    error OldPrice(); 
+    // This error will be used when transfering money to an account fails
+    error WeiTransferFailed(string message);
+
+    // NotEnoughBalance indicates the msg.value is less than expected
+    error NotEnoughBalance();
     
+    // NotEnoughtTokens indicates the amount of tokens you want to purchase is more than actual existing
+    error NotEnoughtTokens();
+
+    // AccessDenied indicates you want to do a operation (CancelRequest or Accept) that you are not allowed to do
+    error AccessDenied();
+
+    // AlreadyRequested indicates that you have already requested for the token_id you are trying to request to again
+    error AlreadyRequested();
+
+    // RequestNotfound is thrown when the caller is not the person that is needed to accept the request
+    error RequestNotfound();
+
+    // RequestIsAccepted is thrown when the publisher tries to cancel its request but the request is accepted beforehand
+    error RequestIsAccepted();
+
     // The Mint would be emitted on Minting new product
     event Mint_event(uint token_id, address recipient, uint amount);
 
@@ -25,6 +43,16 @@ contract Droplinked is ERC1155{
 
     // DisapproveRequest would be emitted when the `disapprove` function is called
     event DisapproveRequest(uint request_id);
+
+    // DirectBuy would be emitted when the `direct_buy` function is called and the transfer is successful
+    event DirectBuy(uint price, address from, address to);
+
+    // RecordedBuy would be emitted when the `buy_recorded` function is called and the transfers are successful
+    event RecordedBuy(address producer, uint token_id, uint shipping, uint tax, uint amount, address buyer);
+
+    // AffiliateBuy would be emitted when the `buy_affiliate` function is called and the transfers are successful
+    event AffiliateBuy(uint request_id, uint amount, uint shipping, uint tax, address buyer);
+
 
     // NFTMetadata Struct
     struct NFTMetadata {
@@ -86,9 +114,11 @@ contract Droplinked is ERC1155{
     constructor(uint _fee, address ratio_verifier) ERC1155("") {
         fee = _fee;
         ratioVerifier = ratio_verifier;
+        // Using price feed of chainlink to get the price of MATIC/USD without external source or centralization
         priceFeed = AggregatorV3Interface(0xd0D5e3DB44DE05E9F294BB0a3bEEaF030DE24Ada);
     }
 
+    // Get the latest price of MATIC/USD with 8 digits shift ( the actual price is 1e-8 times the returned price )
     function getLatestPrice() public view returns (uint){
         (,int256 price,,,) = priceFeed.latestRoundData();
         return uint(price);
@@ -116,10 +146,7 @@ contract Droplinked is ERC1155{
         }
         // If FOUND
         else{
-            // If uri, price and comission was the same, add the amount to it
-            require(keccak256(abi.encode(metadatas[token_id].ipfsUrl)) == keccak256(abi.encode(_uri)));
-            require(metadatas[token_id].price == _price);
-            require(metadatas[token_id].comission == _comission);
+            // Update the old token_ids amount
             holders[msg.sender][token_id] += amount;
         }
         total_supply += amount;
@@ -131,9 +158,13 @@ contract Droplinked is ERC1155{
     }
     
     function publish_request(address producer_account, uint token_id) public{
-        require(isRequested[producer_account][token_id] == false);
+        if (isRequested[producer_account][token_id])
+            revert AlreadyRequested();
+        // Create a new request_id
         uint request_id = request_cnt + 1;
+        // Update the requests_cnt
         request_cnt++;
+        // Create the request and add it to producer's incoming reqs, and publishers outgoing reqs
         requests[request_id].token_id = token_id;
         requests[request_id].producer = producer_account;
         requests[request_id].publisher = msg.sender;
@@ -144,6 +175,7 @@ contract Droplinked is ERC1155{
         emit PulishRequest(token_id, request_id);
     }
 
+    // The overloading of the safeBatchTransferFrom from ERC1155 to update contract variables
     function safeBatchTransferFrom(
         address from,
         address to,
@@ -164,6 +196,8 @@ contract Droplinked is ERC1155{
         }
     }
 
+
+    // ERC1155 overloading to update the contracts state when the safeTrasnferFrom is called
     function safeTransferFrom(
         address from,
         address to,
@@ -182,87 +216,111 @@ contract Droplinked is ERC1155{
 
 
     function approve_request(uint request_id) public {
-        require(producer_requests[msg.sender][request_id] != false);
+        if (!producer_requests[msg.sender][request_id])
+            revert RequestNotfound();
         requests[request_id].accepted = true;
         emit AcceptRequest(request_id);
     }
 
     function cancel_request(uint request_id) public {
-        require(msg.sender == requests[request_cnt].publisher);
-        require(requests[request_id].accepted == false);
+        if (msg.sender != requests[request_id].publisher)
+            revert AccessDenied();
+        if (requests[request_id].accepted)
+            revert RequestIsAccepted();
+        // remove the request from producer's incoming requests, and from publisher's outgoing requests
         producer_requests[requests[request_id].producer][request_id] = false;
         publishers_requests[msg.sender][request_id] = false;
+        // Also set the isRequested to false since we deleted the request
         isRequested[requests[request_id].producer][requests[request_id].token_id] = false;
         emit CancelRequest(request_id);
     }
 
     function disapprove(uint request_id) public {
-        require(msg.sender == requests[request_id].producer);
+        if (msg.sender != requests[request_id].producer)
+            revert AccessDenied();
+        // remove the request from producer's incoming requests, and from publisher's outgoing requests
         producer_requests[msg.sender][request_id] = false;
         publishers_requests[requests[request_id].publisher][request_id] = false;
+        // Also set the isRequested to false since we deleted the request
         isRequested[requests[request_id].producer][requests[request_id].token_id] = false;
+        // And set the `accepted` property of the request to false
         requests[request_id].accepted = false;
         emit DisapproveRequest(request_id);
     }
 
-    function verify_signature(uint ratio, uint _blockHeight, uint8 _v, bytes32 _r, bytes32 _s) view private{
-        if(block.number>_blockHeight+10){
-             revert OldPrice();
-        }
-        bytes32 _hashedMessage = keccak256(abi.encodePacked(ratio,_blockHeight));
-        bytes memory prefix = "\x19Ethereum Signed Message:\n32";
-        bytes32 prefixedHashMessage = keccak256(abi.encodePacked(prefix, _hashedMessage));
-        address signer = ecrecover(prefixedHashMessage, _v, _r, _s);
-        if (signer != ratioVerifier) {
-            revert NotApprovedSign();
-        }
-    }
-
     function direct_buy(uint price, address recipient) public payable {
-        uint totalAmount = (price*getLatestPrice())/1e10;
-        uint droplinkedShare = (totalAmount*fee)/1e2;
-        require(msg.value >= totalAmount , "Not enough tokens!");
+        // Calculations
+        uint ratio = getLatestPrice();
+        uint totalAmount = price * (1e24/ratio);
+        uint droplinkedShare = (totalAmount*fee)/1e4;
+        // check if the sended amount is more than the needed
+        if(msg.value < totalAmount)
+            revert NotEnoughBalance();
+        // Transfer money & checks
         (bool t,) = payable(ratioVerifier).call{value : droplinkedShare}("");
-        require(t , "transfer failed");
+        if (!t)
+            revert WeiTransferFailed("droplinked transfer");
         (t,) = payable(recipient).call{ value : (totalAmount)}("");
-        require(t, "tranfer failed");
+        if(!t)
+            revert WeiTransferFailed("recipient transfer");    
+        emit DirectBuy(price, msg.sender, recipient);    
     }
     
-    function buy_recorded(address producer, uint token_id, uint shipping, uint tax, uint amount, uint ratio, uint _blockHeight, uint8 _v, bytes32 _r, bytes32 _s) public payable{
-        require(holders[producer][token_id] >= amount, "Not enough amount to purchase");
-        verify_signature(ratio, _blockHeight, _v, _r, _s);
-        uint product_price = amount * metadatas[token_id].price * (10000000000000000)* ratio;
-        require(msg.value >= product_price + (shipping + tax)*1000000000000000000);
-        uint droplinked_share = (product_price * fee) / 10000;
-        uint producer_share = (product_price + (shipping + tax)*1000000000000000000) - (droplinked_share);
-        require(holders[producer][token_id] >= amount);
-        payable(ratioVerifier).transfer(droplinked_share);
-        payable(producer).transfer(producer_share);
+    function buy_recorded(address producer, uint token_id, uint shipping, uint tax, uint amount) public payable{
+        if (holders[producer][token_id] < amount)
+            revert NotEnoughtTokens();
+        // Calculations
+        uint ratio = getLatestPrice();
+        uint product_price = (amount * metadatas[token_id].price) * (1e24/ratio);
+        uint totalPrice = product_price + ((shipping + tax)*(1e24/ratio));
+        if (msg.value < totalPrice)
+            revert NotEnoughBalance();
+        uint droplinked_share = (product_price * fee) / 1e4;
+        uint producer_share = totalPrice - droplinked_share;
+        // Transfer the product on the contract state
         holders[msg.sender][token_id] += amount;
         holders[producer][token_id] -= amount;
+        // Actual money transfers & checks
+        (bool result, ) = payable(ratioVerifier).call{ value : droplinked_share }("");
+        if (!result)
+            revert WeiTransferFailed("droplinked transfer");  
+        (result, ) = payable(producer).call{value : producer_share}("");
+        if(!result)
+            revert WeiTransferFailed("producer transfer");          
+        emit RecordedBuy(producer, token_id, shipping, tax, amount, msg.sender);
     }
 
-    function buy_affiliate(uint request_id, uint amount, uint shipping, uint tax, uint ratio, uint _blockHeight, uint8 _v, bytes32 _r, bytes32 _s) public payable{
-        verify_signature(ratio, _blockHeight, _v, _r, _s);
+    function buy_affiliate(uint request_id, uint amount, uint shipping, uint tax) public payable{
+        // checks and calculations
         address prod = requests[request_id].producer;
         address publ = requests[request_id].publisher;
         uint token_id = requests[request_id].token_id;
-        uint product_price = amount * metadatas[token_id].price * ratio * (10000000000000000);
-        uint total_amount = product_price + (shipping + tax)*1000000000000000000;
-        require(msg.value >= total_amount, "Not enough token sent!");
-        require(holders[prod][token_id] >= amount , "Not enough NFTs to purchase!");
-        // Calculations
-        uint droplinked_share = (product_price * fee) / 10000;
-        uint publisher_share = ((product_price - droplinked_share) * metadatas[token_id].comission) / 10000;
+        uint ratio = getLatestPrice();
+        uint product_price = (amount * metadatas[token_id].price * (1e24/ratio));
+        uint total_amount = product_price + ((shipping + tax)*(1e24/ratio));
+        if(msg.value< total_amount)
+            revert NotEnoughBalance();
+
+        if (holders[prod][token_id] < amount)
+            revert NotEnoughtTokens();
+        uint droplinked_share = (product_price * fee) / 1e4;
+        uint publisher_share = ((product_price - droplinked_share) * metadatas[token_id].comission) / 1e4;
         uint producer_share = total_amount - (droplinked_share + publisher_share);
-        // Money transfer
-        payable(ratioVerifier).transfer(droplinked_share);
-        payable(prod).transfer(producer_share);
-        payable(publ).transfer(publisher_share);
-        // Transfer
+        // Transfer on contract
         holders[msg.sender][token_id] += amount;
         holders[prod][token_id] -= amount;
+        // Money transfer
+        (bool result, ) = payable(ratioVerifier).call{value : droplinked_share}("");
+        if(!result)
+            revert WeiTransferFailed("droplinked transfer");        
+        (result, ) = payable(prod).call{value:producer_share}("");
+        if(!result)
+            revert WeiTransferFailed("producer transfer");        
+        (result, ) = payable(publ).call{value:publisher_share}("");
+        if (!result)
+            revert WeiTransferFailed("publisher transfer");        
     }
+    // Returns the totalSupply of the contract
     function totalSupply(uint256 id) public view returns (uint256){
         return token_cnts[id];
     }
